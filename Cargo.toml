@@ -1,0 +1,12 @@
+[package]
+name = "teixml-to-mutable"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Converts TEI-XML to raw phext (multiversal chain format) — stage 0.1: raw phext"
+
+[dependencies]
+libphext = { version = "0.6.0", features = ["binary"] }
+quick-xml = "0.38"
+sha2 = "0.10"
+memmap2 = "0.9"
