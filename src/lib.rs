@@ -1,9 +1,12 @@
-//! teixml-to-mutable 0.1 — TEI-XML → raw phext (SPEC 0.1 v3, task 5.4.6/5.5.5/5.6.5).
+//! teixml-to-mutable — TEI-XML → raw phext (stage 0.1, SPEC 0.1 v3)
+//! and Mutable OS native Caverns (stage 0.2, see `mutable`). Task 5.4.6/5.5.5/5.6.5.
 //!
 //! All phext parsing/serialization goes through libphext-rs 0.6 (the reference
 //! implementation). This crate never parses phext delimiters itself, except the
 //! top-level chain byte scan in the reader, which is cross-checked byte-for-byte
 //! against libphext's `parse_chains` on every open.
+
+pub mod mutable;
 
 use libphext::{binary, phext};
 use sha2::{Digest, Sha256};

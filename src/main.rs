@@ -1,12 +1,14 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use teixml_to_mutable::mutable::export_mutable;
 use teixml_to_mutable::{convert_dir, extract_original, parse_subspace, verify, ChainReader};
 
 fn usage() -> ExitCode {
     eprintln!(
-        "teixml-to-mutable 0.1 — TEI-XML -> raw phext\n\n\
+        "teixml-to-mutable 0.2 — TEI-XML -> raw phext / Mutable OS\n\n\
          USAGE:\n\
          \x20 convert <input-dir> -o <out.phext>\n\
+         \x20 mutable <input-dir> -o <out.zip>\n\
          \x20 extract <chain.phext> <relative-path> -o <out-file>\n\
          \x20 show    <chain.phext> <$N:coordinate>\n\
          \x20 verify  <chain.phext> [--corpus <input-dir>]"
@@ -59,6 +61,45 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("convert failed: {}", e);
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        "mutable" => {
+            let dir = match args.get(1) {
+                Some(d) => PathBuf::from(d),
+                None => return usage(),
+            };
+            let out = match opt(&args, "-o") {
+                Some(o) => PathBuf::from(o),
+                None => return usage(),
+            };
+            match export_mutable(&dir, &out) {
+                Ok(sum) => {
+                    let failed = sum.entries.iter().filter(|e| e.error.is_some()).count();
+                    println!(
+                        "files: {}\ndocuments: {}\nfailures: {}\nvault_guid: {}\nout_bytes: {}",
+                        sum.entries.len(),
+                        sum.documents,
+                        failed,
+                        sum.vault_guid,
+                        sum.out_bytes
+                    );
+                    if failed > 0 {
+                        let report = out.with_extension("failures.txt");
+                        let mut text = String::new();
+                        for e in sum.entries.iter().filter(|e| e.error.is_some()) {
+                            let line = format!("{}\t{}\n", e.rel, e.error.as_deref().unwrap_or(""));
+                            eprint!("{}", line);
+                            text.push_str(&line);
+                        }
+                        let _ = std::fs::write(&report, text);
+                        eprintln!("failure report: {}", report.display());
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("mutable failed: {}", e);
                     ExitCode::FAILURE
                 }
             }
