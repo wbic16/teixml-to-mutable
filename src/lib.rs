@@ -1,5 +1,6 @@
-//! teixml-to-mutable — TEI-XML → raw phext (stage 0.1, SPEC 0.1 v3)
-//! and Mutable OS native Caverns (stage 0.2, see `mutable`). Task 5.4.6/5.5.5/5.6.5.
+//! teixml-to-mutable — TEI-XML → raw phext (stage 0.1, SPEC 0.1 v3),
+//! Mutable OS native Caverns (stage 0.2, see `mutable`), and Phextura
+//! corpora (stage 0.3, see `phextura`). Task 5.4.6/5.5.5/5.6.5.
 //!
 //! All phext parsing/serialization goes through libphext-rs 0.6 (the reference
 //! implementation). This crate never parses phext delimiters itself, except the
@@ -7,6 +8,9 @@
 //! against libphext's `parse_chains` on every open.
 
 pub mod mutable;
+pub mod phextura;
+pub mod segment;
+pub mod vfs;
 
 use libphext::{binary, phext};
 use sha2::{Digest, Sha256};
@@ -41,6 +45,10 @@ pub fn coord(scroll: usize) -> phext::Coordinate {
 pub enum Node {
     Text(String),
     Elem(Element),
+    /// XML comment, text verbatim (stage 0.3 model capture, ruling D3).
+    Comment(String),
+    /// Processing instruction (stage 0.3 model capture, ruling D3).
+    Pi { target: String, data: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -57,11 +65,13 @@ impl Element {
         self.children.iter().any(|c| matches!(c, Node::Elem(_)))
     }
     /// All text nodes of this element's subtree, in document order.
+    /// Comments and PIs are not text nodes and never appear here.
     pub fn text_nodes(&self, out: &mut Vec<String>) {
         for c in &self.children {
             match c {
                 Node::Text(t) => out.push(t.clone()),
                 Node::Elem(e) => e.text_nodes(out),
+                Node::Comment(_) | Node::Pi { .. } => {}
             }
         }
     }
@@ -73,11 +83,302 @@ fn unescape(s: &str) -> Result<String, String> {
         .map_err(|e| format!("unescape: {}", e))
 }
 
+/// A document type declaration, as written (stage 0.3, ruling D3).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Doctype {
+    pub name: String,
+    pub public_id: Option<String>,
+    pub system_id: Option<String>,
+    /// The internal subset verbatim (text between `[` and the closing `]`),
+    /// when the declaration carries one.
+    pub internal_subset: Option<String>,
+}
+
+/// The full parse of one XML document: root element tree plus the prolog
+/// and epilog material (comments, PIs) and the DOCTYPE, which live outside
+/// the root element but are part of the document (stage 0.3, ruling D3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedDocument {
+    pub root: Element,
+    pub doctype: Option<Doctype>,
+    pub prolog: Vec<Node>,
+    pub epilog: Vec<Node>,
+}
+
+/// Extract the internal subset of a DOCTYPE declaration: the verbatim text
+/// between the first `[` outside quotes and its closing `]`, where the
+/// scan is aware of quoted strings, comments, and nested declarations
+/// (a `]` inside any of those does not close the subset).
+fn extract_internal_subset(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut start: Option<usize> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if b == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if b == b'"' || b == b'\'' {
+                    quote = Some(b);
+                } else if b == b'[' {
+                    start = Some(i);
+                    break;
+                }
+            }
+        }
+        i += 1;
+    }
+    let start = start?;
+    let mut j = start + 1;
+    let mut quote: Option<u8> = None;
+    let mut in_comment = false;
+    let mut in_decl = false;
+    while j < bytes.len() {
+        if in_comment {
+            if bytes[j..].starts_with(b"-->") {
+                in_comment = false;
+                j += 3;
+            } else {
+                j += 1;
+            }
+            continue;
+        }
+        match quote {
+            Some(q) => {
+                if bytes[j] == q {
+                    quote = None;
+                }
+                j += 1;
+            }
+            None => {
+                if bytes[j..].starts_with(b"<!--") {
+                    in_comment = true;
+                    j += 4;
+                } else if bytes[j] == b'"' || bytes[j] == b'\'' {
+                    quote = Some(bytes[j]);
+                    j += 1;
+                } else if bytes[j] == b'<' {
+                    in_decl = true;
+                    j += 1;
+                } else if bytes[j] == b'>' {
+                    in_decl = false;
+                    j += 1;
+                } else if bytes[j] == b']' && !in_decl {
+                    return Some(raw[start + 1..j].to_string());
+                } else {
+                    j += 1;
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Recover the raw inner text of the document's `<!DOCTYPE ...>`
+/// declaration from the prolog bytes, or None when there is none.
+/// quick-xml 0.38's DocType event truncates at the first `>` inside an
+/// internal subset (measured: an ENTITY value containing `>` ends the
+/// event mid-subset), so the declaration is scanned here with quote,
+/// comment, and subset awareness. Returns the inner text and the
+/// declaration's byte span in the scanned text — the span matters
+/// because the reader, having truncated its DocType event, re-emits
+/// the rest of the subset (e.g. a subset comment) as ordinary events,
+/// which the span lets the parser suppress.
+fn raw_doctype_inner(text: &str) -> Option<(String, usize, usize)> {
+    let bytes = text.as_bytes();
+    let find = |from: usize, needle: &[u8]| -> Option<usize> {
+        if from > bytes.len() {
+            return None;
+        }
+        bytes[from..]
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .map(|p| p + from)
+    };
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"<!--") {
+            i = find(i, b"-->")? + 3;
+        } else if bytes[i..].starts_with(b"<?") {
+            i = find(i, b"?>")? + 2;
+        } else if bytes[i..].starts_with(b"<!DOCTYPE") {
+            let start = i + "<!DOCTYPE".len();
+            let end = doctype_end(text, start)?;
+            return Some((text[start..end].to_string(), i, end + 1));
+        } else if bytes[i] == b'<' {
+            return None; // the root element begins; no doctype
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// The offset of the `>` that closes a DOCTYPE declaration whose inner
+/// text starts at `start`: a `>` outside quotes, comments, the internal
+/// subset, and any declaration inside the subset.
+fn doctype_end(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut j = start;
+    let mut quote: Option<u8> = None;
+    let mut in_comment = false;
+    let mut in_subset = false;
+    let mut in_decl = false;
+    while j < bytes.len() {
+        if in_comment {
+            if bytes[j..].starts_with(b"-->") {
+                in_comment = false;
+                j += 3;
+            } else {
+                j += 1;
+            }
+            continue;
+        }
+        match quote {
+            Some(q) => {
+                if bytes[j] == q {
+                    quote = None;
+                }
+                j += 1;
+            }
+            None => {
+                if bytes[j..].starts_with(b"<!--") {
+                    in_comment = true;
+                    j += 4;
+                } else if bytes[j] == b'"' || bytes[j] == b'\'' {
+                    quote = Some(bytes[j]);
+                    j += 1;
+                } else if bytes[j] == b'[' {
+                    in_subset = true;
+                    j += 1;
+                } else if bytes[j] == b']' && !in_decl {
+                    in_subset = false;
+                    j += 1;
+                } else if bytes[j] == b'<' && in_subset {
+                    in_decl = true;
+                    j += 1;
+                } else if bytes[j] == b'>' {
+                    if in_decl {
+                        in_decl = false;
+                        j += 1;
+                    } else if !in_subset {
+                        return Some(j);
+                    } else {
+                        j += 1;
+                    }
+                } else {
+                    j += 1;
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parse the inner text of a `<!DOCTYPE ...>` declaration (everything
+/// between `<!DOCTYPE` and the closing `>`).
+pub fn parse_doctype(raw: &str) -> Doctype {
+    let mut dt = Doctype::default();
+    let s = raw.trim_start();
+    // root element name: up to whitespace or '['
+    let name_end = s
+        .find(|c: char| c.is_whitespace() || c == '[')
+        .unwrap_or(s.len());
+    dt.name = s[..name_end].to_string();
+    // tokenize the rest outside the subset: words and quoted strings
+    let rest = &s[name_end..];
+    let subset_at = {
+        let mut quote: Option<char> = None;
+        let mut found = None;
+        for (i, c) in rest.char_indices() {
+            match quote {
+                Some(q) => {
+                    if c == q {
+                        quote = None;
+                    }
+                }
+                None => {
+                    if c == '"' || c == '\'' {
+                        quote = Some(c);
+                    } else if c == '[' {
+                        found = Some(i);
+                        break;
+                    }
+                }
+            }
+        }
+        found
+    };
+    let head = match subset_at {
+        Some(i) => &rest[..i],
+        None => rest,
+    };
+    let mut tokens: Vec<(bool, String)> = Vec::new(); // (is_quoted, text)
+    let mut chars = head.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+        } else if c == '"' || c == '\'' {
+            chars.next();
+            let mut val = String::new();
+            for c2 in chars.by_ref() {
+                if c2 == c {
+                    break;
+                }
+                val.push(c2);
+            }
+            tokens.push((true, val));
+        } else {
+            let mut w = String::new();
+            while let Some(&c2) = chars.peek() {
+                if c2.is_whitespace() {
+                    break;
+                }
+                w.push(c2);
+                chars.next();
+            }
+            tokens.push((false, w));
+        }
+    }
+    let mut i = 0usize;
+    while i < tokens.len() {
+        if !tokens[i].0 && tokens[i].1.eq_ignore_ascii_case("PUBLIC") {
+            if i + 1 < tokens.len() && tokens[i + 1].0 {
+                dt.public_id = Some(tokens[i + 1].1.clone());
+            }
+            if i + 2 < tokens.len() && tokens[i + 2].0 {
+                dt.system_id = Some(tokens[i + 2].1.clone());
+            }
+            break;
+        }
+        if !tokens[i].0 && tokens[i].1.eq_ignore_ascii_case("SYSTEM") {
+            if i + 1 < tokens.len() && tokens[i + 1].0 {
+                dt.system_id = Some(tokens[i + 1].1.clone());
+            }
+            break;
+        }
+        i += 1;
+    }
+    dt.internal_subset = extract_internal_subset(raw);
+    dt
+}
+
 /// Parse one XML document (bytes) into an Element tree.
 /// Namespace URIs are resolved with a prefix-scope stack; attributes keep
-/// their qualified names as written. Comments, PIs, declarations and DOCTYPE
-/// are not represented (the original is preserved verbatim in $1).
+/// their qualified names as written. Since stage 0.3 the tree also carries
+/// comments and PIs as nodes; the 0.1/0.2 emitters skip them (their forms
+/// never represented comments/PIs — the original is preserved verbatim).
 pub fn parse_xml(bytes: &[u8]) -> Result<Element, String> {
+    Ok(parse_xml_full(bytes)?.root)
+}
+
+/// Parse one XML document into root tree + prolog/epilog + DOCTYPE.
+pub fn parse_xml_full(bytes: &[u8]) -> Result<ParsedDocument, String> {
     use quick_xml::events::Event;
     use quick_xml::reader::Reader;
     let mut reader = Reader::from_reader(bytes);
@@ -86,6 +387,15 @@ pub fn parse_xml(bytes: &[u8]) -> Result<Element, String> {
     let mut stack: Vec<Element> = Vec::new();
     let mut scopes: Vec<HashMap<String, String>> = Vec::new();
     let mut root: Option<Element> = None;
+    // The DOCTYPE comes from the raw prolog bytes (see raw_doctype_inner);
+    // the reader's own DocType event is only a fallback.
+    let raw_doctype = raw_doctype_inner(&String::from_utf8_lossy(bytes));
+    let doctype_span: Option<(usize, usize)> =
+        raw_doctype.as_ref().map(|(_, s, e)| (*s, *e));
+    let mut doctype: Option<Doctype> =
+        raw_doctype.map(|(raw, _, _)| parse_doctype(&raw));
+    let mut prolog: Vec<Node> = Vec::new();
+    let mut epilog: Vec<Node> = Vec::new();
 
     fn resolve(qname: &str, own: &HashMap<String, String>, scopes: &[HashMap<String, String>]) -> String {
         let prefix = match qname.split_once(':') {
@@ -182,8 +492,54 @@ pub fn parse_xml(bytes: &[u8]) -> Result<Element, String> {
                     }
                 }
             }
+            Ok(Event::Comment(e)) => {
+                let in_doctype = doctype_span.map_or(false, |(s, e)| {
+                    let pos = reader.buffer_position() as usize;
+                    pos > s && pos <= e
+                });
+                if in_doctype {
+                    // an artifact of the reader's truncated DocType
+                    // event (a comment inside the internal subset),
+                    // not a document comment
+                } else if let Some(parent) = stack.last_mut() {
+                    parent.children.push(Node::Comment(String::from_utf8_lossy(&e).into_owned()));
+                } else if root.is_none() {
+                    prolog.push(Node::Comment(String::from_utf8_lossy(&e).into_owned()));
+                } else {
+                    epilog.push(Node::Comment(String::from_utf8_lossy(&e).into_owned()));
+                }
+            }
+            Ok(Event::PI(e)) => {
+                let in_doctype = doctype_span.map_or(false, |(s, e)| {
+                    let pos = reader.buffer_position() as usize;
+                    pos > s && pos <= e
+                });
+                if in_doctype {
+                    // as for comments: a subset artifact, not a PI
+                } else if let Some(parent) = stack.last_mut() {
+                    parent.children.push(Node::Pi {
+                        target: String::from_utf8_lossy(e.target()).into_owned(),
+                        data: String::from_utf8_lossy(e.content()).into_owned(),
+                    });
+                } else if root.is_none() {
+                    prolog.push(Node::Pi {
+                        target: String::from_utf8_lossy(e.target()).into_owned(),
+                        data: String::from_utf8_lossy(e.content()).into_owned(),
+                    });
+                } else {
+                    epilog.push(Node::Pi {
+                        target: String::from_utf8_lossy(e.target()).into_owned(),
+                        data: String::from_utf8_lossy(e.content()).into_owned(),
+                    });
+                }
+            }
+            Ok(Event::DocType(e)) => {
+                if doctype.is_none() {
+                    doctype = Some(parse_doctype(&String::from_utf8_lossy(&e)));
+                }
+            }
             Ok(Event::Eof) => break,
-            Ok(_) => { /* comments, PIs, declarations, doctype: not represented */ }
+            Ok(_) => { /* XML declarations and anything else: not represented */ }
             Err(e) => return Err(format!("xml: {}", e)),
         }
         buf.clear();
@@ -191,7 +547,8 @@ pub fn parse_xml(bytes: &[u8]) -> Result<Element, String> {
     if !stack.is_empty() {
         return Err("unclosed elements at EOF".into());
     }
-    root.ok_or_else(|| "no root element".to_string())
+    let root = root.ok_or_else(|| "no root element".to_string())?;
+    Ok(ParsedDocument { root, doctype, prolog, epilog })
 }
 
 // ---------------------------------------------------------------------------
@@ -506,6 +863,10 @@ fn emit_local(e: &Element, members: &mut Vec<String>) -> usize {
     for child in &e.children {
         match child {
             Node::Text(t) => scrolls.push(format!("@text\n{}", t)),
+            Node::Comment(_) | Node::Pi { .. } => {
+                // 0.1's form never represented comments/PIs; the original
+                // bytes ride in $1 and stage 0.3 carries them as standoff.
+            }
             Node::Elem(c) => {
                 if c.is_container() {
                     let child_no = emit_local(c, members);
@@ -917,4 +1278,60 @@ pub fn verify(chain: &Path, corpus_dir: Option<&Path>) -> Result<VerifyReport, S
         }
     }
     Ok(rep)
+}
+
+// ---------------------------------------------------------------------------
+// Shared TEI tree helpers (used by the 0.2 Mutable export and 0.3 Phextura;
+// moved here from mutable.rs in stage 0.3 so both stages read one copy)
+
+/// First element with this local name in pre-order (self included).
+pub fn first_named<'a>(el: &'a Element, name: &str) -> Option<&'a Element> {
+    if el.name == name {
+        return Some(el);
+    }
+    for c in &el.children {
+        if let Node::Elem(e) = c {
+            if let Some(found) = first_named(e, name) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// All text of an element's subtree, concatenated in document order.
+pub fn element_text(el: &Element) -> String {
+    let mut nodes = Vec::new();
+    el.text_nodes(&mut nodes);
+    nodes.concat()
+}
+
+/// Whitespace-collapse: runs become one space, ends trimmed.
+pub fn collapse_ws(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Title: teiHeader/fileDesc/titleStmt/title, fallback msIdentifier/idno,
+/// fallback the source filename stem (STAGE2-RECON.md §4.3).
+pub fn extract_title(root: &Element, rel: &str) -> String {
+    if let Some(header) = first_named(root, "teiHeader") {
+        if let Some(stmt) = first_named(header, "titleStmt") {
+            if let Some(title) = first_named(stmt, "title") {
+                let t = collapse_ws(&element_text(title));
+                if !t.is_empty() {
+                    return t;
+                }
+            }
+        }
+    }
+    if let Some(ident) = first_named(root, "msIdentifier") {
+        if let Some(idno) = first_named(ident, "idno") {
+            let t = collapse_ws(&element_text(idno));
+            if !t.is_empty() {
+                return t;
+            }
+        }
+    }
+    let base = rel.rsplit('/').next().unwrap_or(rel);
+    base.rsplit_once('.').map(|(stem, _)| stem.to_string()).unwrap_or_else(|| base.to_string())
 }

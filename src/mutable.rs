@@ -14,11 +14,12 @@
 //! these files, so byte-identical SQL is what makes this the real schema
 //! rather than a lookalike.
 
-use crate::{collect_xml_files, parse_xml, rel_of, sha256_hex, Element, Node};
+use crate::segment::{flatten, kept_map, segment_document};
+use crate::{collect_xml_files, extract_title, parse_xml, rel_of, sha256_hex, Element};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::io::{Read, Seek, Write};
-use std::path::{Path, PathBuf};
+use std::io::{Seek, Write};
+use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Minimal JSON value with two writers matching JavaScript's JSON.stringify:
@@ -152,36 +153,19 @@ impl Json {
 // ---------------------------------------------------------------------------
 // TEI -> Mutable document mapping (STAGE2-RECON.md §4)
 
-/// TEI block-level elements: each owns a text segment; any other element
-/// containing a block-level descendant acts as a container; everything
-/// else is inline and becomes a standoff annotation.
-const BLOCK_ELEMENTS: &[&str] = &[
-    "ab", "additions", "adminInfo", "analytic", "argument", "bibl", "biblStruct",
-    "bindingDesc", "body", "back", "cell", "cit", "closer", "custodialHist",
-    "decoDesc", "div", "div1", "div2", "div3", "div4", "div5", "div6", "div7",
-    "docAuthor", "docDate", "docEdition", "docImprint", "docTitle", "editionStmt",
-    "encodingDesc", "epigraph", "facsimile", "fileDesc", "front", "handDesc",
-    "head", "history", "imprint", "item", "layoutDesc", "lg", "l", "list",
-    "monograph", "msContents", "msDesc", "msItem", "msPart", "notesStmt",
-    "objectDesc", "opener", "origin", "additional", "p", "physDesc",
-    "profileDesc", "publicationStmt", "quote", "recordHist", "respStmt", "row",
-    "series", "seriesStmt", "sealDesc", "sourceDesc", "sp", "stage", "supportDesc",
-    "surface", "table", "text", "titlePage", "titlePart", "titleStmt", "zone",
-];
+/// The segmentation (block table, walk, keep rule) and the title chain
+/// live in `crate::segment` and `crate` since stage 0.3 — one copy, shared
+/// with the Phextura profile, so the stages cannot drift.
 
-fn is_block(name: &str) -> bool {
-    BLOCK_ELEMENTS.contains(&name)
+/// One kept segment as the document builder consumes it, with its inline
+/// occurrences re-expressed in Mutable's inclusive Cell offsets.
+struct SegView {
+    owner: String,
+    text: String,
+    anns: Vec<AnnView>,
 }
 
-fn has_block_descendant(el: &Element) -> bool {
-    el.children.iter().any(|c| match c {
-        Node::Elem(e) => is_block(&e.name) || has_block_descendant(e),
-        Node::Text(_) => false,
-    })
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct Ann {
+struct AnnView {
     id: usize,
     name: String,
     ns: String,
@@ -189,152 +173,6 @@ struct Ann {
     start: i64,
     end: i64,
     zero_width: bool,
-}
-
-#[derive(Debug)]
-struct Seg {
-    owner: String,
-    text: String,
-    chars: usize,
-    anns: Vec<Ann>,
-}
-
-#[derive(Default)]
-struct Builder {
-    segs: Vec<Seg>,
-    next_ann: usize,
-}
-
-impl Builder {
-    fn seg_for(&mut self, cur: &mut Option<usize>, owner: &str) -> usize {
-        if let Some(i) = *cur {
-            return i;
-        }
-        self.segs.push(Seg {
-            owner: owner.to_string(),
-            text: String::new(),
-            chars: 0,
-            anns: Vec::new(),
-        });
-        let i = self.segs.len() - 1;
-        *cur = Some(i);
-        i
-    }
-
-    fn push_text(&mut self, seg: usize, text: &str) {
-        let s = &mut self.segs[seg];
-        s.text.push_str(text);
-        s.chars += text.chars().count();
-    }
-
-    /// Walk an element's children in a container context: `cur` is the open
-    /// segment for direct text of `el`; block-level children close it.
-    fn children(&mut self, el: &Element, cur: &mut Option<usize>) {
-        for child in &el.children {
-            match child {
-                Node::Text(t) => {
-                    let i = self.seg_for(cur, &el.name);
-                    self.push_text(i, t);
-                }
-                Node::Elem(e) => {
-                    if is_block(&e.name) || has_block_descendant(e) {
-                        *cur = None;
-                        let mut inner = None;
-                        self.children(e, &mut inner);
-                    } else {
-                        let i = self.seg_for(cur, &el.name);
-                        self.inline_into(i, e);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Record an inline element as a standoff annotation on segment `seg`
-    /// and walk its (guaranteed block-free) subtree into the same segment.
-    fn inline_into(&mut self, seg: usize, el: &Element) {
-        let start = self.segs[seg].chars as i64;
-        self.next_ann += 1;
-        // xmlns declarations are namespace machinery, not TEI attributes;
-        // the resolved namespace is recorded separately on the annotation.
-        let attrs: Vec<(String, String)> = el
-            .attrs
-            .iter()
-            .filter(|(k, _)| k != "xmlns" && !k.starts_with("xmlns:"))
-            .cloned()
-            .collect();
-        let at = self.segs[seg].anns.len();
-        self.segs[seg].anns.push(Ann {
-            id: self.next_ann,
-            name: el.name.clone(),
-            ns: el.ns.clone(),
-            attrs,
-            start,
-            end: start - 1,
-            zero_width: true,
-        });
-        for child in &el.children {
-            match child {
-                Node::Text(t) => self.push_text(seg, t),
-                Node::Elem(e) => self.inline_into(seg, e),
-            }
-        }
-        let end = self.segs[seg].chars as i64 - 1;
-        if end >= start {
-            let a = &mut self.segs[seg].anns[at];
-            a.end = end;
-            a.zero_width = false;
-        }
-    }
-}
-
-fn first_named<'a>(el: &'a Element, name: &str) -> Option<&'a Element> {
-    if el.name == name {
-        return Some(el);
-    }
-    for c in &el.children {
-        if let Node::Elem(e) = c {
-            if let Some(found) = first_named(e, name) {
-                return Some(found);
-            }
-        }
-    }
-    None
-}
-
-fn element_text(el: &Element) -> String {
-    let mut nodes = Vec::new();
-    el.text_nodes(&mut nodes);
-    nodes.concat()
-}
-
-fn collapse_ws(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Title: teiHeader/fileDesc/titleStmt/title, fallback msIdentifier/idno,
-/// fallback the source filename stem (STAGE2-RECON.md §4.3).
-fn extract_title(root: &Element, rel: &str) -> String {
-    if let Some(header) = first_named(root, "teiHeader") {
-        if let Some(stmt) = first_named(header, "titleStmt") {
-            if let Some(title) = first_named(stmt, "title") {
-                let t = collapse_ws(&element_text(title));
-                if !t.is_empty() {
-                    return t;
-                }
-            }
-        }
-    }
-    if let Some(ident) = first_named(root, "msIdentifier") {
-        if let Some(idno) = first_named(ident, "idno") {
-            let t = collapse_ws(&element_text(idno));
-            if !t.is_empty() {
-                return t;
-            }
-        }
-    }
-    let base = rel.rsplit('/').next().unwrap_or(rel);
-    base.rsplit_once('.').map(|(stem, _)| stem.to_string()).unwrap_or_else(|| base.to_string())
 }
 
 /// Deterministic resourceId: a UUID-shaped digest of the source relative
@@ -427,16 +265,40 @@ pub fn build_document(rel: &str, root: &Element) -> MutableDocument {
         None => ".".to_string(),
     };
 
-    let mut builder = Builder::default();
-    let mut cur = None;
-    builder.children(root, &mut cur);
+    let flat = flatten(root);
+    let segmentation = segment_document(root, &flat);
+    let kept = kept_map(&segmentation);
     // Drop segments carrying nothing: whitespace-only text with no
     // annotations is inter-block formatting, not content (recon §4.4).
-    let segs: Vec<Seg> = builder
-        .segs
-        .into_iter()
-        .filter(|s| !s.text.trim().is_empty() || !s.anns.is_empty())
-        .collect();
+    // Annotation ids run in walk order exactly as the pre-0.3 Builder
+    // assigned them: kept segments preserve walk order, and a segment
+    // carrying annotations is never dropped, so the sequence is identical.
+    // Offsets convert from the shared half-open scalar spans to Mutable's
+    // inclusive Cell offsets: end − 1, with start == end staying zero-width
+    // at end = start − 1 (the pre-0.3 Builder's exact convention).
+    let mut next_ann = 0usize;
+    let mut segs: Vec<SegView> = Vec::new();
+    for (raw, keep) in segmentation.segments.iter().zip(kept.iter()) {
+        if keep.is_none() {
+            continue;
+        }
+        let mut anns = Vec::with_capacity(raw.inlines.len());
+        for occ in &raw.inlines {
+            next_ann += 1;
+            let start = occ.start as i64;
+            let zero_width = occ.start == occ.end;
+            anns.push(AnnView {
+                id: next_ann,
+                name: occ.name.clone(),
+                ns: occ.ns.clone(),
+                attrs: occ.attrs.clone(),
+                start,
+                end: if zero_width { start - 1 } else { occ.end as i64 - 1 },
+                zero_width,
+            });
+        }
+        segs.push(SegView { owner: raw.owner_name.clone(), text: raw.text.clone(), anns });
+    }
 
     let plain_text: String = segs.iter().map(|s| s.text.as_str()).collect();
     let annotations: usize = segs.iter().map(|s| s.anns.len()).sum();
@@ -773,7 +635,7 @@ pub fn export_mutable(dir: &Path, out: &Path) -> Result<MutableSummary, String> 
     let mut zip = zip::ZipWriter::new(std::io::BufWriter::new(out_file));
     let result = (|| -> Result<Vec<MutableEntry>, String> {
         let mut dirs: HashSet<String> = HashSet::new();
-        let mut ensure_dir = |zip: &mut zip::ZipWriter<_>, d: &str, dirs: &mut HashSet<String>| -> Result<(), String> {
+        let ensure_dir = |zip: &mut zip::ZipWriter<_>, d: &str, dirs: &mut HashSet<String>| -> Result<(), String> {
             if d.is_empty() || d == "." || !dirs.insert(d.to_string()) {
                 return Ok(());
             }
