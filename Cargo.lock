@@ -419,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "teixml-to-mutable"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "libphext",
  "memmap2",

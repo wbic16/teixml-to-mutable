@@ -130,6 +130,46 @@ directly, no phext involved:
   Knowledge rows are derived state: Mutable's indexer populates them
   from the documents when the Cavern is opened.
 
+### 0.3 — Phextura corpora with standoff
+
+`teixml-to-mutable phextura <input-dir> -o <out-dir> [--no-vfs]`
+writes **four files** per input directory, per the TEI profile
+(`TEI.md`, DRAFT v0.1, in this repo and at the root of
+[wbic16/phextura](https://github.com/wbic16/phextura)):
+
+- `<name>.phext` — the **base corpus**: one Series per TEI document,
+  0.2's segmentation reused (one segment = one Body scroll), bibentries
+  in Collection 2, media headers in Collection 3, originals hoisted
+  verbatim into Collection 5, metadata + manifest + object table in
+  Collection 6.
+- `<name>.standoff.phext` — the **standoff corpus**: one entry per
+  element occurrence (plus one per comment and processing
+  instruction), each with a full STANDOFF §2.3 survival kit, anchored
+  to the base edition by a `px2:` address with a 16-hex edition pin
+  and half-open Unicode-scalar spans over the target scroll's full
+  stored text. Attributes ride as backslash-escaped `attr-` lines.
+- `cavern.phext` — a **PhextVFS image** holding the pair as its files
+  (`/<name>.phext`, `/<name>.standoff.phext`, documents stratum),
+  for Mutable's phext mode; emitted by default, `--no-vfs` opts out.
+  The pair is stored in the VFS binary format (base64 chunks) because
+  phext bytes contain dimension breaks the VFS text format refuses;
+  Mutable's own PhextVFS reader opens it, its L9 checksums verify,
+  and the pair reads back byte-identical.
+- `<name>.failures.txt` — the named-failure report, as in 0.1/0.2.
+
+`verify-phextura <base.phext> <standoff.phext> [--corpus <dir>]` runs
+the DESIGN §7 validator (checksums recompute, object table rebuilds
+byte-for-byte) and, with `--corpus`, the reconstruction checker
+(TEI-equivalence from the pair alone, originals byte-identical);
+`relocate-phextura <base.phext> <standoff.phext>` runs the §2.4
+anchor re-location harness (anchors resolve EXACT against the pinned
+edition; drifted editions detach as ANCHOR-LOST/AMBIGUOUS, never
+silently re-attach).
+
+On the Wellcome corpus (1,886 files, 1,875 converted / 11 failed):
+base 58,053,699 B (142,619 scrolls), standoff 341,302,423 B
+(386,175 scrolls, 384,298 entries), image 533,212,798 B.
+
 Files that are not well-formed XML are **named in the failure report**
 (`<out>.failures.txt`) — never silently skipped; in 0.1 their originals
 are still stored in $1 and extract byte-identically, and in 0.2 they
@@ -140,9 +180,12 @@ still ride in the Cavern tree.
 ```
 teixml-to-mutable convert <input-dir> -o <out.phext>
 teixml-to-mutable mutable <input-dir> -o <out.zip>
+teixml-to-mutable phextura <input-dir> -o <out-dir> [--no-vfs]
 teixml-to-mutable extract <chain.phext> <relative-path> -o <out-file>   # SHA-256 verified
 teixml-to-mutable show    <chain.phext> '$2:1.1.1/1.1.1/1.1.1'          # mmap reader + index
 teixml-to-mutable verify  <chain.phext> [--corpus <input-dir>]
+teixml-to-mutable verify-phextura <base.phext> <standoff.phext> [--corpus <input-dir>]
+teixml-to-mutable relocate-phextura <base.phext> <standoff.phext>
 ```
 
 The reader memory-maps the chain, builds a coordinate→span index in one
@@ -152,8 +195,10 @@ scan (all coordinates/offsets computed by libphext), and resolves
 ## Known limits
 
 - Comments, processing instructions and DOCTYPE are not represented in
-  the converted forms (they are preserved in the kept originals: $1 in
-  0.1, the Cavern tree in 0.2).
+  the converted forms of 0.1 and 0.2 (they are preserved in the kept
+  originals: $1 in 0.1, the Cavern tree in 0.2). In 0.3 they are:
+  comments and PIs are standoff entries, DOCTYPE is metadata lines
+  with its internal subset hoisted (TEI.md §4.1, §2.6).
 - Appending a whole new *file* to an existing 0.1 chain is not
   implemented: $1's index cannot be extended without rewriting it.
   Appending member universes (`append_member`) leaves all prior bytes

@@ -1,9 +1,9 @@
 [package]
 name = "teixml-to-mutable"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
-description = "Converts TEI-XML to raw phext (stage 0.1) and to Mutable OS native Caverns (stage 0.2) — the TEI-XML → Phextura migrator"
+description = "Converts TEI-XML to raw phext (stage 0.1), to Mutable OS native Caverns (stage 0.2), and to Phextura corpora with standoff (stage 0.3) — the TEI-XML → Phextura migrator"
 repository = "https://github.com/wbic16/teixml-to-mutable"
 homepage = "https://github.com/wbic16/teixml-to-mutable"
 documentation = "https://docs.rs/teixml-to-mutable"
